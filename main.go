@@ -124,7 +124,7 @@ func matchMaking() func(*fiber.Ctx) error {
 		//    생성된 방 구조체의 정보 (접속 경로, 유저 정보, 진영 정보)를 각각의 유저에게 전달
 
 		fmt.Printf("user's pointer first check: %p \n", &user)
-		matchMakingRequest(user)
+		matchMakingRequest(&user)
 
 		if mt, msg, err = c.ReadMessage(); err != nil {
 			log.Println("read:", err)
@@ -187,11 +187,11 @@ func matchMaking() func(*fiber.Ctx) error {
 }
 
 // 매치메이킹 채널에 유저 정보 전달
-func matchMakingRequest(user User) {
+func matchMakingRequest(user *User) {
 	// matchMakingChannel = make(chan User)
 
 	// matchQueue를 수신하는 채널에 user 정보 전달
-	matchQueue <- &user
+	matchQueue <- user
 }
 
 // goroutine으로 매치메이킹 채널을 계속해서 확인
@@ -200,6 +200,7 @@ func matchUsers() {
 		select {
 		case userInfo := <-matchQueue:
 			// 매칭을 대기하는 유저 맵 생성
+			fmt.Printf("pointer!!! : %p, \n", userInfo)
 			users[userInfo.ID] = userInfo
 
 			if users[userInfo.ID] == userInfo {
