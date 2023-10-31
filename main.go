@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
@@ -35,6 +36,7 @@ import (
 )
 
 func main() {
+
 	app := fiber.New()
 
 	app.Use("/ws", func(c *fiber.Ctx) error {
@@ -47,7 +49,9 @@ func main() {
 		return fiber.ErrUpgradeRequired
 	})
 
-	app.Get("/ws/matchMaking:id", matchMaking())
+	app.Get("/ws/match", matchMaking())
+
+	go matchUsers()
 
 	log.Fatal(app.Listen(":3000"))
 	// Access the websocket server: ws://localhost:3000/ws/123?v=1.0
@@ -56,33 +60,46 @@ func main() {
 
 type User struct {
 	conn   *websocket.Conn
-	ID     string
+	ID     string `json:"id"`
 	Rating int
-	side   int // 8 : 초나라, 16 : 한나라
+	side   int   // 8 : 초나라, 16 : 한나라
+	room   *Room // 방 정보를 저장하는 포인터
 }
 
 type Room struct {
-	ID   string
-	Name string
-	User [2]User
-	Time time.Time
+	ID     string
+	Users  [2]*User
+	Status int // 0 : 대기, 1 : 게임 중, 2 : 게임 종료
+}
+type Game struct {
+	// Room  Room
+	// User  [2]User
+	Move [2]int    `json:"move"`
+	Turn int       `json:"turn"`
+	Over bool      `json:"over"`
+	Time time.Time `json:"time"`
 }
 
-type Game struct {
-	Room  Room
-	User  [2]User
-	Move  string
-	Turn  int
-	Over  bool
-	Start time.Time
+// 웹소켓 통신에 사용되는 메세지는 무조건 아래 구조체를 따른다.
+// 메시지 구조체를 직렬화 하여 행동과 메세지로 구별된 json을 클라이언트가 받는다.
+type Message struct {
+	Action string `json:"action"`
+	Msg    []byte `json:"msg"`
 }
+
+// var 정의
+var (
+	rwMutex    = new(sync.RWMutex)
+	matchQueue = make(chan *User, 1)
+	users      = make(map[string]*User)
+	rooms      = make(map[string]*Room)
+)
 
 // 매치 메이킹 웹소켓 핸들러
 func matchMaking() func(*fiber.Ctx) error {
 	return websocket.New(func(c *websocket.Conn) {
 		// c.Locals is added to the *websocket.Conn
 		log.Println(c.Locals("allowed")) // true
-		log.Println(c.Params("id"))      // 123
 		// log.Println(c.Cookies("session")) // ""
 
 		// websocket.Conn bindings https://pkg.go.dev/github.com/fasthttp/websocket?tab=doc#pkg-index
@@ -91,54 +108,112 @@ func matchMaking() func(*fiber.Ctx) error {
 			msg []byte
 			err error
 		)
-		for {
-			if mt, msg, err = c.ReadMessage(); err != nil {
-				log.Println("read:", err)
-				break
+		if mt, msg, err = c.ReadMessage(); err != nil {
+			log.Println("read:", err)
+		}
+		fmt.Println(mt, string(msg))
+		var user User
+		// msg 변수를 User 구조체로 변환
+		json.Unmarshal(msg, &user)
+		user.conn = c
+		// 추후 추가 : db에서 유저 정보를 끌어와서 레이팅을 설정한다.
+		// user.Rating = rating
+
+		// 대기열 채널에 User.ID를 추가 후 매칭을 기다림
+		//	  채널에서 매칭이 되면, 두 유저의 정보를 받아서 방 구조체를 생성 후 맵에 추가
+		//    생성된 방 구조체의 정보 (접속 경로, 유저 정보, 진영 정보)를 각각의 유저에게 전달
+
+		fmt.Printf("user's pointer first check: %p \n", &user)
+		matchMakingRequest(user)
+
+		if mt, msg, err = c.ReadMessage(); err != nil {
+			log.Println("read:", err)
+		}
+		fmt.Println(mt, string(msg), "====================")
+		// client가 "done"을 보내면, 게임 방 형성이 완료되었다는 뜻이다.
+		if string(msg) == "done" {
+			// 다른 유저도 "done"을 보냈는지 확인한다.
+			fmt.Println("check user who send done: ", &user)
+			fmt.Printf("user's pointer second check: %p \n", &user)
+
+			room := user.room
+
+			return
+
+			if room == nil {
+				fmt.Println("room nil", user, room)
 			}
-			fmt.Println(mt, string(msg))
 
-			var user User
-			// msg 변수를 User 구조체로 변환
-			json.Unmarshal(msg, &user)
-			user.conn = c
-			users[user.ID] = &user
+			//slice에 append할 때를 대비 해 lock을 걸어두자
 
-			// 추후 추가 : db에서 유저 정보를 끌어와서 레이팅을 설정한다.
+			fmt.Println(room.Users)
 
-			// 대기열 채널에 User.ID를 추가 후 매칭을 기다림
-			//	  채널에서 매칭이 되면, 두 유저의 정보를 받아서 방 구조체를 생성 후 맵에 추가
-			//    생성된 방 구조체의 정보 (접속 경로, 유저 정보, 진영 정보)를 각각의 유저에게 전달
-			matchMakingRequest(user)
+			rwMutex.Lock()
+			for i := 0; i < len(room.Users); i++ {
+				if room.Users[i] == nil {
+					room.Users[i] = &user
+					break
+				}
+			}
+			rwMutex.Unlock()
 
-			//
+			fmt.Println("check room users : ", room.Users)
+
+			if len(room.Users) == 1 {
+
+				// 30초 정도의 타임 아웃을 두고, "done"을 보내지 않는다면, 방의 상태를 2으로 변경한다.
+				for time.Since(time.Now()).Seconds() < 30 {
+					if len(room.Users) == 2 {
+						fmt.Println("check ready for User in joining room : ", room.Users)
+						// 방의 상태가 1로 변경되고, 게임이 시작된다.
+						room.Status = 1
+						go GameCommunication(user)
+						break
+					} else {
+						room.Status = 2
+						// 게임이 종료된 것이다. (타임 아웃)
+						// 추후에 아래와 같은 로직을 추가한다.
+						// 응답하지 않은 유저 디비에 경고 회수를 증가시키고
+						// 응답한 유저는 재매칭을 시도하게 한다.
+						continue
+					}
+				}
+			}
+			// 두 유저가 모두 "done"을 보냈다면, 방의 상태를 1로 변경한다.
+			room.Status = 1
+			go GameCommunication(user)
 		}
 	})
 }
 
-// 매치메이킹 채널
-var (
-	matchQueue = make(chan *User)
-	users      = make(map[string]*User)
-)
-
-// 고루틴 함수 : 매치메이킹 프로세스
+// 매치메이킹 채널에 유저 정보 전달
 func matchMakingRequest(user User) {
 	// matchMakingChannel = make(chan User)
 
-	// 채널에 유저가 들어오면, 대기열 슬라이스에 유저 추가
+	// matchQueue를 수신하는 채널에 user 정보 전달
 	matchQueue <- &user
 }
 
+// goroutine으로 매치메이킹 채널을 계속해서 확인
 func matchUsers() {
 	for {
 		select {
-		case user := <-matchQueue:
+		case userInfo := <-matchQueue:
+			// 매칭을 대기하는 유저 맵 생성
+			users[userInfo.ID] = userInfo
+
+			if users[userInfo.ID] == userInfo {
+				fmt.Printf("pointer is same for : %p, %p \n", userInfo, users[userInfo.ID])
+			}
+			fmt.Println("match get user", &userInfo, "in users size of ", len(users))
+			fmt.Println("users : ", users)
+			fmt.Println("====================")
 			// Try to find a match for the client
-			for _, otherUser := range users {
-				if user.ID != otherUser.ID {
+			for key := range users {
+				otherUser := users[key]
+				if userInfo.ID != otherUser.ID {
 					// Found a match, handle the matchmaking logic here
-					MatchUsersLogic(user, otherUser)
+					MatchUsersLogic(userInfo, otherUser)
 				}
 			}
 		}
@@ -149,15 +224,102 @@ func MatchUsersLogic(user1, user2 *User) {
 	// Implement your matchmaking logic here
 	// 추후 추가 : 레이팅을 비교해서 매칭을 시도한다.
 
+	// 방 생성 후 User.conn 에 방 정보를 저장 (방법?)
+
+	// UUID 생성
+	// uuid
+
+	room := &Room{
+		ID:     "1",
+		Users:  [2]*User{},
+		Status: 0,
+	}
+
+	msg, err := json.Marshal(room)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// Room 정보를 각각의 user에 저장
+	user1.room = room
+	user2.room = room
+
+	user1.side = 8
+	user2.side = 16
+
 	// For example, you can send a message to both clients that they are matched
-	user1.conn.WriteMessage(websocket.TextMessage, []byte("You are matched!"))
-	user2.conn.WriteMessage(websocket.TextMessage, []byte("You are matched!"))
+	user1.conn.WriteMessage(websocket.TextMessage, makeMessage("matched", msg))
+	user2.conn.WriteMessage(websocket.TextMessage, makeMessage("matched", msg))
 
 	// Remove clients from the matchmaking queue and clients map
 	delete(users, user1.ID)
 	delete(users, user2.ID)
 
-	// 웹소켓 종료
-	user1.conn.Close()
-	user2.conn.Close()
+	fmt.Printf("check two user inMatchUsersLogic : %p, %p \n", &user1, &user2)
+}
+
+// 게임 진행을 담당하는 고루틴
+func GameCommunication(user User) {
+	fmt.Println("Game Start")
+	for {
+		game := Game{}
+		room := user.room
+		fmt.Println("check room : ", room.ID, room.Users, room.Status)
+
+		_, msg, err := user.conn.ReadMessage()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		json.Unmarshal(msg, &game)
+		game.Move = diagonalSymmetry(game.Move[0], game.Move[1])
+		msg, err = json.Marshal(game)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		for _, otherUser := range room.Users {
+			if user.ID != otherUser.ID {
+				otherUser.conn.WriteMessage(websocket.TextMessage, makeMessage("move", msg))
+			}
+		}
+
+		// 만약, game.Over가 true라면, 게임이 종료된 것이다.
+		// room map에서 해당 방을 삭제한다.
+		// 두 유저에게 게임 종료 정보를 전달하고, (추후)변화된 레이팅 값을 데이터베이스에 저장한다.
+		if game.Over {
+			room.Status = 2
+			delete(rooms, room.ID)
+			for _, otherUser := range room.Users {
+				if user.ID != otherUser.ID {
+					msg := []byte("Game Over")
+					otherUser.conn.WriteMessage(websocket.TextMessage, makeMessage("end", msg))
+				} else {
+					msg := []byte("Game Over")
+					user.conn.WriteMessage(websocket.TextMessage, makeMessage("end", msg))
+				}
+			}
+			return
+		}
+	}
+}
+
+func makeMessage(action string, msg []byte) []byte {
+	message := Message{}
+	message.Action = action
+	message.Msg = msg
+
+	m, err := json.Marshal(&message)
+	if err != nil {
+		fmt.Println(err)
+		return nil
+	}
+	return m
+}
+
+// // 프론트엔드에서 처리할 부분?
+func diagonalSymmetry(x, y int) [2]int {
+	return [2]int{9 - x, 8 - y}
 }
