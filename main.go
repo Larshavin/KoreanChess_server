@@ -59,32 +59,36 @@ func main() {
 }
 
 type User struct {
-	conn   *websocket.Conn
-	ID     string `json:"id"`
-	Rating int
-	side   int   // 8 : 초나라, 16 : 한나라
-	room   *Room // 방 정보를 저장하는 포인터
+	conn      *websocket.Conn
+	ID        string `json:"id"`
+	Formation string `json:"formation"`
+	Rating    int
+	Side      int   // 8 : 초나라, 16 : 한나라
+	room      *Room // 방 정보를 저장하는 포인터
 }
 
 type Room struct {
-	ID     string
-	Users  [2]*User
-	Status int // 0 : 대기, 1 : 게임 중, 2 : 게임 종료
+	ID     string   `json:"id"`
+	Users  [2]*User `json:"users"`
+	Status int      `json:"status"` // 0 : 대기, 1 : 게임 중, 2 : 게임 종료
 }
 type Game struct {
-	// Room  Room
-	// User  [2]User
-	Move [2]int    `json:"move"`
+	Move Move      `json:"move"`
 	Turn int       `json:"turn"`
 	Over bool      `json:"over"`
 	Time time.Time `json:"time"`
 }
 
+type Move struct {
+	Current  [2]int `json:"current"`
+	Previous [2]int `json:"previous"`
+}
+
 // 웹소켓 통신에 사용되는 메세지는 무조건 아래 구조체를 따른다.
 // 메시지 구조체를 직렬화 하여 행동과 메세지로 구별된 json을 클라이언트가 받는다.
 type Message struct {
-	Action string `json:"action"`
-	Msg    []byte `json:"msg"`
+	Action string      `json:"action"`
+	Msg    interface{} `json:"msg"`
 }
 
 // var 정의
@@ -104,17 +108,18 @@ func matchMaking() func(*fiber.Ctx) error {
 
 		// websocket.Conn bindings https://pkg.go.dev/github.com/fasthttp/websocket?tab=doc#pkg-index
 		var (
-			mt  int
 			msg []byte
 			err error
 		)
-		if mt, msg, err = c.ReadMessage(); err != nil {
+		if _, msg, err = c.ReadMessage(); err != nil {
 			log.Println("read:", err)
 		}
-		fmt.Println(mt, string(msg))
 		var user User
 		// msg 변수를 User 구조체로 변환
-		json.Unmarshal(msg, &user)
+		err = json.Unmarshal(msg, &user)
+		if err != nil {
+			fmt.Println(err)
+		}
 		user.conn = c
 
 		// 추후 추가 : db에서 유저 정보를 끌어와서 레이팅을 설정한다.
@@ -130,7 +135,7 @@ func matchMaking() func(*fiber.Ctx) error {
 		// fmt.Printf("user %p : wating for user to complete match making \n", &user)
 		// fmt.Println("user detail: ", user)
 
-		if mt, msg, err = c.ReadMessage(); err != nil {
+		if _, msg, err = c.ReadMessage(); err != nil {
 			log.Println("read:", err)
 		}
 
@@ -220,22 +225,16 @@ func MatchUsersLogic(user1, user2 *User) {
 		Status: 0,
 	}
 
-	msg, err := json.Marshal(room)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
 	// Room 정보를 각각의 user에 저장
 	user1.room = room
 	user2.room = room
 
-	user1.side = 8
-	user2.side = 16
+	user1.Side = 8
+	user2.Side = 16
 
 	// For example, you can send a message to both clients that they are matched
-	user1.conn.WriteMessage(websocket.TextMessage, makeMessage("matched", msg))
-	user2.conn.WriteMessage(websocket.TextMessage, makeMessage("matched", msg))
+	user1.conn.WriteMessage(websocket.TextMessage, makeMessage("matched", user1))
+	user2.conn.WriteMessage(websocket.TextMessage, makeMessage("matched", user2))
 
 	// Remove clients from the matchmaking queue and clients map
 	delete(users, user1.ID)
@@ -244,13 +243,13 @@ func MatchUsersLogic(user1, user2 *User) {
 
 // 게임 진행을 담당하는 함수
 func GameCommunication(user User) {
-	fmt.Println("Game Start")
-	for {
-		game := Game{}
-		room := user.room
-		fmt.Println("check room : ", room.ID, room.Users, room.Status)
-		// fmt.Println(user.conn)
 
+	game := Game{}
+	room := user.room
+
+	user.conn.WriteMessage(websocket.TextMessage, makeMessage("start", room))
+
+	for {
 		_, msg, err := user.conn.ReadMessage()
 		if err != nil {
 			fmt.Println(err, "in ReadMessage")
@@ -258,15 +257,12 @@ func GameCommunication(user User) {
 		}
 
 		json.Unmarshal(msg, &game)
-		game.Move = diagonalSymmetry(game.Move[0], game.Move[1])
-		msg, err = json.Marshal(game)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
+		game.Move.Current = diagonalSymmetry(game.Move.Current[0], game.Move.Current[1])
+		game.Move.Previous = diagonalSymmetry(game.Move.Previous[0], game.Move.Previous[1])
+
 		for _, otherUser := range room.Users {
 			if user.ID != otherUser.ID {
-				otherUser.conn.WriteMessage(websocket.TextMessage, makeMessage("move", msg))
+				otherUser.conn.WriteMessage(websocket.TextMessage, makeMessage("move", game))
 			}
 		}
 
@@ -290,7 +286,7 @@ func GameCommunication(user User) {
 	}
 }
 
-func makeMessage(action string, msg []byte) []byte {
+func makeMessage(action string, msg interface{}) []byte {
 	message := Message{}
 	message.Action = action
 	message.Msg = msg
