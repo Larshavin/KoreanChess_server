@@ -116,6 +116,7 @@ func matchMaking() func(*fiber.Ctx) error {
 		// msg 변수를 User 구조체로 변환
 		json.Unmarshal(msg, &user)
 		user.conn = c
+
 		// 추후 추가 : db에서 유저 정보를 끌어와서 레이팅을 설정한다.
 		// user.Rating = rating
 
@@ -123,30 +124,28 @@ func matchMaking() func(*fiber.Ctx) error {
 		//	  채널에서 매칭이 되면, 두 유저의 정보를 받아서 방 구조체를 생성 후 맵에 추가
 		//    생성된 방 구조체의 정보 (접속 경로, 유저 정보, 진영 정보)를 각각의 유저에게 전달
 
-		fmt.Printf("user's pointer first check: %p \n", &user)
+		// fmt.Printf("user's pointer first check: %p \n", &user)
 		matchMakingRequest(&user)
+
+		// fmt.Printf("user %p : wating for user to complete match making \n", &user)
+		// fmt.Println("user detail: ", user)
 
 		if mt, msg, err = c.ReadMessage(); err != nil {
 			log.Println("read:", err)
 		}
-		fmt.Println(mt, string(msg), "====================")
+
 		// client가 "done"을 보내면, 게임 방 형성이 완료되었다는 뜻이다.
 		if string(msg) == "done" {
-			// 다른 유저도 "done"을 보냈는지 확인한다.
-			fmt.Println("check user who send done: ", &user)
-			fmt.Printf("user's pointer second check: %p \n", &user)
-
 			room := user.room
 
-			return
+			// fmt.Println("user : ", user, "room : ", room)
 
 			if room == nil {
-				fmt.Println("room nil", user, room)
+				fmt.Println("Problem !! : room nil", user, room)
+				return
 			}
 
 			//slice에 append할 때를 대비 해 lock을 걸어두자
-
-			fmt.Println(room.Users)
 
 			rwMutex.Lock()
 			for i := 0; i < len(room.Users); i++ {
@@ -157,39 +156,34 @@ func matchMaking() func(*fiber.Ctx) error {
 			}
 			rwMutex.Unlock()
 
-			fmt.Println("check room users : ", room.Users)
-
-			if len(room.Users) == 1 {
-
-				// 30초 정도의 타임 아웃을 두고, "done"을 보내지 않는다면, 방의 상태를 2으로 변경한다.
-				for time.Since(time.Now()).Seconds() < 30 {
-					if len(room.Users) == 2 {
+			if room.Users[0] == nil || room.Users[1] == nil {
+				// // 10초 정도의 타임 아웃을 두고, room.Users의 요소 값들이 nil이 되지 않으면, 방의 상태를 1로 변경한다.
+				for time.Since(time.Now()) < 10*time.Second {
+					// fmt.Println("waiting for other user to complete match making : ", time.Since(time.Now()).Seconds())
+					if room.Users[0] != nil && room.Users[1] != nil {
 						fmt.Println("check ready for User in joining room : ", room.Users)
-						// 방의 상태가 1로 변경되고, 게임이 시작된다.
-						room.Status = 1
-						go GameCommunication(user)
-						break
-					} else {
-						room.Status = 2
-						// 게임이 종료된 것이다. (타임 아웃)
-						// 추후에 아래와 같은 로직을 추가한다.
-						// 응답하지 않은 유저 디비에 경고 회수를 증가시키고
-						// 응답한 유저는 재매칭을 시도하게 한다.
-						continue
+						goto RoomIsReady
 					}
 				}
+				// ...
+				// 게임이 종료된 것이다. (타임 아웃)
+				// 추후에 아래와 같은 로직을 추가한다.
+				// 추후에 아래와 같은 로직을 추가한다.
+				// 응답하지 않은 유저 디비에 경고 회수를 증가시키고
+				// 응답한 유저는 재매칭을 시도하게 한다.
+				fmt.Println("Game Over : Timeout")
+				room.Status = 2
+				return
 			}
-			// 두 유저가 모두 "done"을 보냈다면, 방의 상태를 1로 변경한다.
+		RoomIsReady:
 			room.Status = 1
-			go GameCommunication(user)
+			GameCommunication(user)
 		}
 	})
 }
 
 // 매치메이킹 채널에 유저 정보 전달
 func matchMakingRequest(user *User) {
-	// matchMakingChannel = make(chan User)
-
 	// matchQueue를 수신하는 채널에 user 정보 전달
 	matchQueue <- user
 }
@@ -200,15 +194,7 @@ func matchUsers() {
 		select {
 		case userInfo := <-matchQueue:
 			// 매칭을 대기하는 유저 맵 생성
-			fmt.Printf("pointer!!! : %p, \n", userInfo)
 			users[userInfo.ID] = userInfo
-
-			if users[userInfo.ID] == userInfo {
-				fmt.Printf("pointer is same for : %p, %p \n", userInfo, users[userInfo.ID])
-			}
-			fmt.Println("match get user", &userInfo, "in users size of ", len(users))
-			fmt.Println("users : ", users)
-			fmt.Println("====================")
 			// Try to find a match for the client
 			for key := range users {
 				otherUser := users[key]
@@ -224,8 +210,6 @@ func matchUsers() {
 func MatchUsersLogic(user1, user2 *User) {
 	// Implement your matchmaking logic here
 	// 추후 추가 : 레이팅을 비교해서 매칭을 시도한다.
-
-	// 방 생성 후 User.conn 에 방 정보를 저장 (방법?)
 
 	// UUID 생성
 	// uuid
@@ -256,21 +240,20 @@ func MatchUsersLogic(user1, user2 *User) {
 	// Remove clients from the matchmaking queue and clients map
 	delete(users, user1.ID)
 	delete(users, user2.ID)
-
-	fmt.Printf("check two user inMatchUsersLogic : %p, %p \n", &user1, &user2)
 }
 
-// 게임 진행을 담당하는 고루틴
+// 게임 진행을 담당하는 함수
 func GameCommunication(user User) {
 	fmt.Println("Game Start")
 	for {
 		game := Game{}
 		room := user.room
 		fmt.Println("check room : ", room.ID, room.Users, room.Status)
+		// fmt.Println(user.conn)
 
 		_, msg, err := user.conn.ReadMessage()
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println(err, "in ReadMessage")
 			return
 		}
 
